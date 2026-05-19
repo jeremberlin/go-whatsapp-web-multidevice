@@ -1,0 +1,126 @@
+name: Upstream drift check
+
+# Surveille l'amont (aldinokemal/go-whatsapp-web-multidevice) une fois
+# par semaine. Si upstream/main a avancé, on ouvre (ou met à jour) une
+# issue GitHub sur ce fork pour qu'on sache qu'il faut soit :
+#   - rebase notre patch sur les nouveaux commits si rien de cassant,
+#   - ou supprimer le fork si upstream a fini par implémenter
+#     LoginDeviceWithCode lui-même (on peut alors revenir sur l'image
+#     officielle aldinokemal2104/go-whatsapp-web-multidevice:latest).
+#
+# La notification se fait via le mail GitHub standard sur l'ouverture
+# d'issue — pas de webhook custom à maintenir. Idempotent : si l'issue
+# existe déjà et est ouverte, on la met à jour au lieu d'en créer une 2e.
+
+on:
+  schedule:
+    - cron: '0 9 * * 1' # tous les lundis 9h UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/aldinokemal/go-whatsapp-web-multidevice.git || true
+          git fetch upstream main
+
+      - name: Compute drift
+        id: drift
+        run: |
+          set -euo pipefail
+          AHEAD=$(git rev-list --count HEAD..upstream/main)
+          echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
+
+          DEVICE_DIFF=$(git diff HEAD upstream/main -- src/usecase/device.go | head -c 200 || true)
+          if [ -n "$DEVICE_DIFF" ]; then
+            echo "device_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "device_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          CHANGED_FILES=$(git diff --name-only HEAD upstream/main | head -50)
+          {
+            echo "changed_files<<EOF"
+            echo "$CHANGED_FILES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "recent_commits<<EOF"
+            git log --oneline HEAD..upstream/main | head -30
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open or update drift issue
+        if: steps.drift.outputs.ahead != '0'
+        uses: actions/github-script@v7
+        env:
+          AHEAD: ${{ steps.drift.outputs.ahead }}
+          DEVICE_CHANGED: ${{ steps.drift.outputs.device_changed }}
+          CHANGED_FILES: ${{ steps.drift.outputs.changed_files }}
+          RECENT_COMMITS: ${{ steps.drift.outputs.recent_commits }}
+        with:
+          script: |
+            const title = '🔔 Upstream Gowa drift — rebase needed'
+            const ahead = process.env.AHEAD
+            const deviceChanged = process.env.DEVICE_CHANGED === 'true'
+            const files = process.env.CHANGED_FILES || '(none)'
+            const commits = process.env.RECENT_COMMITS || '(none)'
+
+            const flag = deviceChanged
+              ? '⚠️ **`src/usecase/device.go` a changé upstream** — vérifier si notre patch `LoginDeviceWithCode` est obsolète (upstream a peut-être implémenté !). Si oui : supprimer le fork, revenir sur l\'image officielle.\n\n'
+              : '✅ Notre patch `src/usecase/device.go` n\'est pas concerné par les commits upstream — un simple rebase devrait suffire.\n\n'
+
+            const body = [
+              `Upstream est en avance de **${ahead} commit(s)** par rapport à ce fork.`,
+              '',
+              flag,
+              '**Fichiers modifiés upstream :**',
+              '```',
+              files,
+              '```',
+              '',
+              '**Commits récents :**',
+              '```',
+              commits,
+              '```',
+              '',
+              '---',
+              '_Auto-généré par `.github/workflows/upstream-check.yml`. Fermer cette issue après rebase / no-op._',
+            ].join('\n')
+
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'upstream-drift',
+            })
+
+            if (existing.data.length > 0) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.data[0].number,
+                body,
+              })
+              core.info(`Updated existing drift issue #${existing.data[0].number}`)
+            } else {
+              const created = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['upstream-drift'],
+              })
+              core.info(`Opened drift issue #${created.data.number}`)
+            }

@@ -6,7 +6,11 @@ import (
 
 	domainDevice "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/device"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
+	pkgError "github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/error"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/ui/websocket"
+	"github.com/aldinokemal/go-whatsapp-web-multidevice/validations"
+	"github.com/sirupsen/logrus"
+	"go.mau.fi/whatsmeow"
 )
 
 type serviceDevice struct {
@@ -68,8 +72,53 @@ func (s *serviceDevice) LoginDevice(_ context.Context, _ string) error {
 	return fmt.Errorf("device login per ID is not implemented yet")
 }
 
-func (s *serviceDevice) LoginDeviceWithCode(_ context.Context, _ string, _ string) (string, error) {
-	return "", fmt.Errorf("device login with code is not implemented yet")
+// LoginDeviceWithCode generates an 8-character WhatsApp pairing code for the
+// given device, so the coach can finish the link from WhatsApp Business
+// -> Settings -> Linked devices -> "Link with phone number" without ever
+// scanning a QR. Mirrors serviceApp.LoginWithCode (single-device path that
+// has been working since v6.x) but scoped per device_id via the manager,
+// which is the missing piece for our multi-coach (multi-device) setup.
+func (s *serviceDevice) LoginDeviceWithCode(ctx context.Context, deviceID string, phoneNumber string) (string, error) {
+	if s.manager == nil {
+		return "", fmt.Errorf("device manager not initialized")
+	}
+	if err := validations.ValidateLoginWithCode(ctx, phoneNumber); err != nil {
+		logrus.Errorf("[LOGIN_CODE][%s] phone validation failed: %s", deviceID, err.Error())
+		return "", err
+	}
+
+	instance, err := s.manager.EnsureClient(ctx, deviceID)
+	if err != nil {
+		return "", err
+	}
+	client := instance.GetClient()
+	if client == nil {
+		return "", pkgError.ErrWaCLI
+	}
+
+	if client.IsLoggedIn() {
+		instance.UpdateStateFromClient()
+		return "", pkgError.ErrAlreadyLoggedIn
+	}
+
+	// PairPhone requires an active socket; reconnect if the device is in
+	// an idle state (e.g. just brought up from disk via EnsureClient).
+	if !client.IsConnected() {
+		if err = client.Connect(); err != nil {
+			return "", err
+		}
+	}
+
+	logrus.Infof("[LOGIN_CODE][%s] requesting pair code for %s", deviceID, phoneNumber)
+	loginCode, err := client.PairPhone(ctx, phoneNumber, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+	if err != nil {
+		logrus.Errorf("[LOGIN_CODE][%s] PairPhone failed: %s", deviceID, err.Error())
+		return "", err
+	}
+
+	instance.UpdateStateFromClient()
+	logrus.Infof("[LOGIN_CODE][%s] pair code issued: %s", deviceID, loginCode)
+	return loginCode, nil
 }
 
 func (s *serviceDevice) LogoutDevice(ctx context.Context, deviceID string) error {

@@ -1,0 +1,54 @@
+name: Build and push Atletio image
+
+# Pourquoi ce workflow en plus de `build-docker-image.yaml` upstream ?
+# Upstream ne déclenche un build que sur tag `vX.Y.Z`. Nous, on veut
+# que chaque commit sur `main` reconstruise l'image Atletio pour que
+# Render puisse pull une image fraîche du patch `LoginDeviceWithCode`
+# sans attendre une release upstream taguée.
+#
+# Cible image : ghcr.io/jeremberlin/go-whatsapp-web-multidevice:paircode
+# Pinning chez Atletio : services/whatsapp-bridge/Dockerfile.gowa pointe
+# sur le tag `paircode` (rolling) + on a aussi un tag immuable par SHA
+# pour pouvoir rollback proprement.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'docker/golang.Dockerfile'
+      - '.github/workflows/coachflow-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push (amd64)
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          context: .
+          file: ./docker/golang.Dockerfile
+          platforms: linux/amd64
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/go-whatsapp-web-multidevice:paircode
+            ghcr.io/${{ github.repository_owner }}/go-whatsapp-web-multidevice:paircode-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
